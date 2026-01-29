@@ -1,0 +1,7 @@
+# Credentials - do not commit
+secret.h
+
+# Arduino/ESP32 build
+*.elf
+*.bin
+build/
