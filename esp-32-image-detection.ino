@@ -6,8 +6,13 @@
 #include <ArduinoJson.h>
 #include <Preferences.h>
 #include <time.h>
+#include "esp_sleep.h"
 
-#include "secret.h"         // AWS_IOT_ENDPOINT, AWS_IOT_PORT, DEVICE_ID, AWS_CERT_*, WIFI_CONFIG_URL
+#include "secret.h"
+
+// Wake every N minutes: connect WiFi + AWS, take one image, publish, then deep sleep.
+#define WAKE_INTERVAL_MINUTES  20
+#define WAKE_INTERVAL_US       ((uint64_t)(WAKE_INTERVAL_MINUTES) * 60ULL * 1000000ULL)         // AWS_IOT_ENDPOINT, AWS_IOT_PORT, DEVICE_ID, AWS_CERT_*, WIFI_CONFIG_URL
 
 // ===========================
 // Wi-Fi config from AWS: path wifi_config/{DEVICE_ID}.json (e.g. wifi_config/esp_01.json).
@@ -507,59 +512,53 @@ bool publishImageBinary(const uint8_t* data, size_t len) {
   return ok;
 }
 
+// Wake every WAKE_INTERVAL_MINUTES: connect WiFi + AWS, one image, publish, deep sleep.
+static void goToSleep();
+
 // ---------- Arduino ----------
 void setup() {
   Serial.begin(115200);
   delay(200);
 
+  Serial.printf("Wake: connect WiFi + AWS, one image, publish, sleep %u min.\n", (unsigned)WAKE_INTERVAL_MINUTES);
+
   if (!initCamera()) {
-    Serial.println("FATAL: camera init failed."); while (true) delay(1000);
+    Serial.println("FATAL: camera init failed."); goToSleep();
   }
 
-  // Predefined first, then fetch from AWS by DEVICE_ID; try cloud, else stay on predefined
   ensureWiFiConnected();
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("FATAL: no WiFi connected."); while (true) delay(1000);
+    Serial.println("FATAL: no WiFi connected."); goToSleep();
   }
 
   ensureTimeIST();
-  connectAWS();
+  if (!connectAWS()) {
+    Serial.println("MQTT connect failed; skipping publish."); goToSleep();
+  }
 
-  lastPublishMs = millis();
+  // Single image capture and publish
+  uint8_t* img = nullptr; size_t len = 0;
+  if (captureToPSRAM(img, len)) {
+    if (mqttClient.connected()) {
+      publishImageBinary(img, len);
+    }
+    free(img);
+  } else {
+    Serial.println("Capture failed.");
+  }
+
+  mqttClient.disconnect();
+  WiFi.disconnect(true);
+  Serial.printf("Going to deep sleep for %u minutes...\n", (unsigned)WAKE_INTERVAL_MINUTES);
+  goToSleep();
 }
 
 void loop() {
-  // Every loop: check WiFi. If disconnected, predefined first -> fetch from AWS (by DEVICE_ID) -> try cloud -> else predefined.
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi lost. Reconnecting (predefined -> AWS -> cloud or predefined)...");
-    ensureWiFiConnected();
-  }
+  // Never reached: setup() calls goToSleep() and device reboots on wake.
+  delay(1000);
+}
 
-  // MQTT and image only when WiFi is connected
-  if (WiFi.status() != WL_CONNECTED) return;
-
-  if (!mqttClient.connected()) {
-    unsigned long now = millis();
-    if (now - lastMqttAttempt > MQTT_RETRY_MS) {
-      lastMqttAttempt = now;
-      connectAWS();
-    }
-  } else {
-    mqttClient.loop();
-  }
-
-  unsigned long now = millis();
-  if (now - lastPublishMs >= PUBLISH_INTERVAL_MS) {
-    lastPublishMs = now;
-
-    if (mqttClient.connected()) {
-      uint8_t* img = nullptr; size_t len = 0;
-      if (captureToPSRAM(img, len)) {
-        publishImageBinary(img, len);
-        free(img);
-      }
-    } else {
-      Serial.println("Skip publish: MQTT not connected.");
-    }
-  }
+static void goToSleep() {
+  esp_sleep_enable_timer_wakeup(WAKE_INTERVAL_US);
+  esp_deep_sleep_start();
 }
