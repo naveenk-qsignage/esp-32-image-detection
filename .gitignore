@@ -5,3 +5,6 @@ secret.h
 *.elf
 *.bin
 build/
+
+# IDE
+.vscode/
