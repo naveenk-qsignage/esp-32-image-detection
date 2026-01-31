@@ -1,17 +1,125 @@
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <HTTPClient.h>
 #include <PubSubClient.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
 #include <time.h>
+#include "esp_sleep.h"
 
-#include "secret.h"         // AWS_IOT_ENDPOINT, AWS_IOT_PORT, DEVICE_ID, AWS_CERT_*
+#include "secret.h"
+
+// Wake every N minutes: connect WiFi + AWS, take one image, publish, then deep sleep.
+#define WAKE_INTERVAL_MINUTES  20
+#define WAKE_INTERVAL_US       ((uint64_t)(WAKE_INTERVAL_MINUTES) * 60ULL * 1000000ULL)         // AWS_IOT_ENDPOINT, AWS_IOT_PORT, DEVICE_ID, AWS_CERT_*, WIFI_CONFIG_URL
 
 // ===========================
-// Wi-Fi credentials (same variables as your example)
+// Wi-Fi config from AWS: path wifi_config/{DEVICE_ID}.json (e.g. wifi_config/esp_01.json).
+// Two ways: (1) HTTP: WIFI_CONFIG_URL + DEVICE_ID + WIFI_CONFIG_SUFFIX (S3 or API Gateway).
+//           (2) Endpoint/MQTT: set WIFI_CONFIG_VIA_IOT in secret.h; device publishes to
+//               wifi_config/request/{DEVICE_ID}, subscribes to wifi_config/response/{DEVICE_ID}; Lambda reads S3 and publishes response.
 // ===========================
-#define  ssid WIFI_SSID
-#define  password WIFI_PASSWORD
+#ifndef WIFI_CONFIG_URL
+#define WIFI_CONFIG_URL "https://qsignage-esp32-cam.s3.ap-south-1.amazonaws.com/wifi_config/"
+#endif
+#ifndef WIFI_CONFIG_SUFFIX
+#define WIFI_CONFIG_SUFFIX ".json"
+#endif
+// Uncomment in secret.h to fetch WiFi config via IoT (MQTT) instead of HTTP:
+// #define WIFI_CONFIG_VIA_IOT 1
+#ifndef WIFI_CONFIG_VIA_IOT
+#define WIFI_CONFIG_VIA_IOT 0
+#endif
+#define WIFI_CONFIG_REQUEST_TOPIC  "wifi_config/request/"
+#define WIFI_CONFIG_RESPONSE_TOPIC "wifi_config/response/"
 
+#define CLOUD_WIFI_TIMEOUT_MS 15000  // try cloud WiFi this long before falling back to predefined
+
+String wifiSsidFromCloud;
+String wifiPasswordFromCloud;
+bool wifiConfigFromCloud = false;
+
+#define BOOTSTRAP_SSID    WIFI_SSID
+#define BOOTSTRAP_PASSWORD WIFI_PASSWORD
+
+// NVS (Preferences): store AWS WiFi config so it persists and is overwritten when AWS config changes
+#define NVS_WIFI_NAMESPACE "wifi"
+#define NVS_KEY_SSID      "ssid"
+#define NVS_KEY_PASS      "pass"
+
+static void saveWifiConfigToNVS(const String& ssid, const String& pass) {
+  Preferences prefs;
+  if (!prefs.begin(NVS_WIFI_NAMESPACE, false)) return;
+  prefs.putString(NVS_KEY_SSID, ssid);
+  prefs.putString(NVS_KEY_PASS, pass);
+  prefs.end();
+  Serial.printf("Saved AWS WiFi config to NVS: SSID=%s\n", ssid.c_str());
+}
+
+// Load last saved AWS WiFi config from NVS. Returns true if valid config was found.
+static bool loadWifiConfigFromNVS(String& ssid, String& pass) {
+  Preferences prefs;
+  if (!prefs.begin(NVS_WIFI_NAMESPACE, true)) return false;
+  if (!prefs.isKey(NVS_KEY_SSID)) { prefs.end(); return false; }
+  ssid = prefs.getString(NVS_KEY_SSID, "");
+  pass = prefs.getString(NVS_KEY_PASS, "");
+  prefs.end();
+  return (ssid.length() > 0);
+}
+
+// Default WiFi list when no S3 config for this DEVICE_ID (tried in order)
+static const struct { const char* ssid; const char* pass; } defaultWifiList[] = {
+  { BOOTSTRAP_SSID, BOOTSTRAP_PASSWORD },
+  // Add more: { "OtherSSID", "OtherPassword" },
+};
+#define DEFAULT_WIFI_COUNT ((int)(sizeof(defaultWifiList) / sizeof(defaultWifiList[0])))
+
+// Try each default network until one connects. Returns true if connected.
+static bool connectWithDefaultWifiList() {
+  if (WiFi.status() == WL_CONNECTED) return true;
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  const unsigned long tryMs = 12000;  // per network
+  for (int i = 0; i < DEFAULT_WIFI_COUNT; i++) {
+    Serial.printf("Trying default WiFi [%d/%d] %s ... ", i + 1, DEFAULT_WIFI_COUNT, defaultWifiList[i].ssid);
+    WiFi.disconnect(true);
+    delay(300);
+    WiFi.begin(defaultWifiList[i].ssid, defaultWifiList[i].pass);
+    unsigned long start = millis();
+    while (WiFi.status() != WL_CONNECTED && (millis() - start) < tryMs) {
+      delay(300);
+      Serial.print(".");
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\nWiFi connected (default list): " + WiFi.localIP().toString());
+      return true;
+    }
+    Serial.println(" timeout");
+  }
+  return false;
+}
+
+// Try to connect to given SSID/password with timeout. Returns true if connected.
+static bool tryConnectWifiWithTimeout(const char* ssid, const char* pass, unsigned long timeoutMs) {
+  if (WiFi.status() == WL_CONNECTED) return true;
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.disconnect(true);
+  delay(300);
+  WiFi.begin(ssid, pass);
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - start) < timeoutMs) {
+    delay(300);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected: " + WiFi.localIP().toString());
+    return true;
+  }
+  Serial.println(" timeout");
+  return false;
+}
 
 // ===== AI-Thinker ESP32-CAM pins =====
 #ifndef CAMERA_MODEL_AI_THINKER
@@ -46,6 +154,11 @@ unsigned long lastPublishMs   = 0;
 unsigned long lastMqttAttempt = 0;
 
 // ===== Networking =====
+// WiFi config via MQTT: response payload and flag (set in callback)
+#define WIFI_CONFIG_RESPONSE_BUF_SZ 512
+static char     wifiConfigResponseBuf[WIFI_CONFIG_RESPONSE_BUF_SZ];
+static bool     wifiConfigResponseReceived = false;
+
 WiFiClientSecure wifiClient;
 PubSubClient     mqttClient(wifiClient);
 
@@ -117,16 +230,210 @@ bool initCamera() {
   return true;
 }
 
-// ---------- Wi-Fi / AWS ----------
-void connectWiFi() {
-  if (WiFi.status() == WL_CONNECTED) return;
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);                 // same variables as your code
-  Serial.print("WiFi connecting");
-  while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
-  Serial.println("\nWiFi connected: " + WiFi.localIP().toString());
-  WiFi.setSleep(false);
+// ---------- Parse WiFi config JSON into wifiSsidFromCloud / wifiPasswordFromCloud / wifiConfigFromCloud ----------
+// Expects {"ssid":"...", "password":"..."} or {"wifi_ssid":"...", "wifi_password":"..."}. Returns true on success.
+static bool parseWifiConfigJson(const char* payload) {
+  if (!payload || !payload[0]) return false;
+  StaticJsonDocument<512> doc;
+  if (deserializeJson(doc, payload)) return false;
+  const char* ssidStr = doc["ssid"].as<const char*>();
+  if (!ssidStr || !ssidStr[0]) ssidStr = doc["wifi_ssid"].as<const char*>();
+  const char* passStr = doc["password"].as<const char*>();
+  if (!passStr) passStr = doc["wifi_password"].as<const char*>();
+  if (!ssidStr || !ssidStr[0]) return false;
+  wifiSsidFromCloud = String(ssidStr);
+  wifiPasswordFromCloud = String(passStr ? passStr : "");
+  wifiConfigFromCloud = true;
+  return true;
 }
+
+// ---------- Fetch WiFi config from AWS (wifi_config/{DEVICE_ID}.json) ----------
+#define AWS_FETCH_MAX_RETRIES 5
+#define AWS_FETCH_RETRY_DELAY_MS 2000
+// Call only when already connected (predefined WiFi). Expects JSON:
+//   {"ssid":"...", "password":"..."}  or  {"wifi_ssid":"...", "wifi_password":"..."}
+bool fetchWifiConfigFromAWS() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("fetchWifiConfig: not connected.");
+    return false;
+  }
+
+  String url = String(WIFI_CONFIG_URL) + DEVICE_ID + WIFI_CONFIG_SUFFIX;
+  Serial.printf("Fetching WiFi config from AWS (max %d tries): %s\n", AWS_FETCH_MAX_RETRIES, url.c_str());
+
+  for (int attempt = 1; attempt <= AWS_FETCH_MAX_RETRIES; attempt++) {
+    Serial.printf("  Attempt %d/%d ... ", attempt, AWS_FETCH_MAX_RETRIES);
+
+    WiFiClientSecure httpSecure;
+    httpSecure.setCACert(AWS_CERT_CA);
+    httpSecure.setTimeout(10);
+
+    HTTPClient http;
+    if (!http.begin(httpSecure, url)) {
+      Serial.println("HTTP begin failed.");
+      if (attempt < AWS_FETCH_MAX_RETRIES) { delay(AWS_FETCH_RETRY_DELAY_MS); continue; }
+      return false;
+    }
+
+    http.setTimeout(10000);
+    int code = http.GET();
+
+    if (code != HTTP_CODE_OK) {
+      Serial.printf("HTTP %d\n", code);
+      http.end();
+      if (attempt < AWS_FETCH_MAX_RETRIES) { delay(AWS_FETCH_RETRY_DELAY_MS); continue; }
+      return false;
+    }
+
+    String payload = http.getString();
+    http.end();
+
+    if (!parseWifiConfigJson(payload.c_str())) {
+      Serial.println("JSON parse failed or no ssid.");
+      if (attempt < AWS_FETCH_MAX_RETRIES) { delay(AWS_FETCH_RETRY_DELAY_MS); continue; }
+      return false;
+    }
+
+    saveWifiConfigToNVS(wifiSsidFromCloud, wifiPasswordFromCloud);  // overwrite NVS when AWS config changes
+    Serial.println("OK");
+    Serial.printf("--- Fetched data from AWS (wifi_config/%s.json) ---\n", DEVICE_ID);
+    Serial.printf("  SSID: %s\n", wifiSsidFromCloud.c_str());
+    Serial.println("----------------------------");
+    return true;
+  }
+
+  Serial.println("All retries failed.");
+  return false;
+}
+
+#if WIFI_CONFIG_VIA_IOT
+// MQTT callback: store payload when topic is wifi_config/response/{DEVICE_ID}
+static void wifiConfigMqttCallback(char* topic, byte* payload, unsigned int length) {
+  String responseTopic = String(WIFI_CONFIG_RESPONSE_TOPIC) + DEVICE_ID;
+  if (responseTopic != topic) return;
+  wifiConfigResponseReceived = true;
+  size_t copyLen = (length < (unsigned)(WIFI_CONFIG_RESPONSE_BUF_SZ - 1)) ? length : (WIFI_CONFIG_RESPONSE_BUF_SZ - 1);
+  memcpy(wifiConfigResponseBuf, payload, copyLen);
+  wifiConfigResponseBuf[copyLen] = '\0';
+  Serial.printf("JSON received on response_topic: %s\n", (const char*)wifiConfigResponseBuf);
+}
+
+// Fetch WiFi config via IoT endpoint (MQTT): publish to wifi_config/request/{DEVICE_ID}, subscribe to wifi_config/response/{DEVICE_ID}.
+// Call only when MQTT is already connected. Lambda (triggered by IoT Rule) reads S3 and publishes response.
+#define WIFI_CONFIG_IOT_WAIT_MS 12000  // allow time for Lambda cold start
+bool fetchWifiConfigFromIoT() {
+  if (!mqttClient.connected()) {
+    Serial.println("fetchWifiConfigFromIoT: MQTT not connected.");
+    return false;
+  }
+  wifiConfigResponseReceived = false;
+  wifiConfigResponseBuf[0] = '\0';
+
+  String reqTopic  = String(WIFI_CONFIG_REQUEST_TOPIC)  + DEVICE_ID;
+  String respTopic = String(WIFI_CONFIG_RESPONSE_TOPIC) + DEVICE_ID;
+
+  mqttClient.setCallback(wifiConfigMqttCallback);
+  if (!mqttClient.subscribe(respTopic.c_str(), 0)) {
+    Serial.println("subscribe response topic failed");
+    return false;
+  }
+  // Give broker a moment to register subscription before publishing request
+  delay(300);
+  Serial.printf("Requesting WiFi config via IoT: %s -> %s\n", reqTopic.c_str(), respTopic.c_str());
+  if (!mqttClient.publish(reqTopic.c_str(), "", false)) {
+    Serial.println("publish request failed");
+    return false;
+  }
+
+  unsigned long start = millis();
+  while (!wifiConfigResponseReceived && (millis() - start) < WIFI_CONFIG_IOT_WAIT_MS) {
+    mqttClient.loop();
+    delay(50);
+  }
+  mqttClient.setCallback(nullptr);
+
+  if (!wifiConfigResponseReceived) {
+    Serial.println("WiFi config response timeout.");
+    return false;
+  }
+  Serial.printf("JSON received on %s: %s\n", respTopic.c_str(), wifiConfigResponseBuf);
+  if (!parseWifiConfigJson(wifiConfigResponseBuf)) {
+    Serial.println("WiFi config response: invalid JSON.");
+    return false;
+  }
+  saveWifiConfigToNVS(wifiSsidFromCloud, wifiPasswordFromCloud);  // overwrite NVS when AWS config changes
+  Serial.printf("--- Fetched WiFi config via IoT (wifi_config/%s) ---\n", DEVICE_ID);
+  Serial.printf("  SSID: %s\n", wifiSsidFromCloud.c_str());
+  Serial.println("----------------------------");
+  return true;
+}
+#endif
+
+// ---------- Wi-Fi: ensure connected (predefined first, then try cloud from AWS if we have config) ----------
+// Forward: fetch from AWS (when already connected), replace NVS if new data, try cloud WiFi or stay/default
+void fetchFromAWSAndMaybeSwitch();
+
+// Connection order: 1) Try NVS (last AWS config), 2) Try default list, 3) Fetch from AWS and replace NVS if new data, 4) If NVS and AWS both fail use default.
+void ensureWiFiConnected() {
+  if (WiFi.status() == WL_CONNECTED) return;
+
+  // Step 1: Try NVS first (last saved AWS config)
+  String nvsSsid, nvsPass;
+  if (loadWifiConfigFromNVS(nvsSsid, nvsPass)) {
+    Serial.println("Trying saved NVS WiFi (last AWS config)...");
+    if (tryConnectWifiWithTimeout(nvsSsid.c_str(), nvsPass.c_str(), CLOUD_WIFI_TIMEOUT_MS)) {
+      Serial.println("Connected via NVS.");
+      fetchFromAWSAndMaybeSwitch();  // fetch from AWS, replace NVS if new data, try cloud WiFi or stay/default
+      return;
+    }
+  }
+  // Step 2: NVS failed or empty - try default list
+  Serial.println("NVS failed or not in range; trying default WiFi...");
+  if (!connectWithDefaultWifiList()) return;
+  Serial.println("Connected via default.");
+  // Step 3: Fetch from AWS; if new data replace NVS, then try cloud WiFi or stay on default
+  fetchFromAWSAndMaybeSwitch();
+}
+
+// Call only when already connected (NVS or default). Fetch from AWS; if success save to NVS (overwrite) and try cloud WiFi; if cloud fail use default. If AWS fail stay on current WiFi.
+#if WIFI_CONFIG_VIA_IOT
+void fetchFromAWSAndMaybeSwitch() {
+  Serial.println("Fetching WiFi config from AWS via IoT (MQTT)...");
+  ensureTimeIST();
+  if (!connectAWS()) {
+    Serial.println("MQTT connect failed; staying on current WiFi (NVS or default).");
+    return;
+  }
+  if (fetchWifiConfigFromIoT()) {
+    mqttClient.disconnect();
+    WiFi.disconnect(true);
+    delay(500);
+    Serial.print("Trying cloud WiFi (from AWS)... ");
+    if (tryConnectWifiWithTimeout(wifiSsidFromCloud.c_str(), wifiPasswordFromCloud.c_str(), CLOUD_WIFI_TIMEOUT_MS)) return;
+    Serial.println("Cloud WiFi not found; falling back to default.");
+    wifiConfigFromCloud = false;
+    connectWithDefaultWifiList();
+  } else {
+    mqttClient.disconnect();
+    Serial.println("No AWS config from IoT; staying on current WiFi (NVS or default).");
+  }
+}
+#else
+void fetchFromAWSAndMaybeSwitch() {
+  Serial.println("Fetching WiFi config from AWS (HTTP)...");
+  if (fetchWifiConfigFromAWS()) {
+    WiFi.disconnect(true);
+    delay(500);
+    Serial.print("Trying cloud WiFi (from AWS)... ");
+    if (tryConnectWifiWithTimeout(wifiSsidFromCloud.c_str(), wifiPasswordFromCloud.c_str(), CLOUD_WIFI_TIMEOUT_MS)) return;
+    Serial.println("Cloud WiFi not found; falling back to default.");
+    wifiConfigFromCloud = false;
+    connectWithDefaultWifiList();
+  } else {
+    Serial.println("No AWS config; staying on current WiFi (NVS or default).");
+  }
+}
+#endif
 
 bool connectAWS() {
   if (mqttClient.connected()) return true;
@@ -205,47 +512,53 @@ bool publishImageBinary(const uint8_t* data, size_t len) {
   return ok;
 }
 
+// Wake every WAKE_INTERVAL_MINUTES: connect WiFi + AWS, one image, publish, deep sleep.
+static void goToSleep();
+
 // ---------- Arduino ----------
 void setup() {
   Serial.begin(115200);
   delay(200);
 
+  Serial.printf("Wake: connect WiFi + AWS, one image, publish, sleep %u min.\n", (unsigned)WAKE_INTERVAL_MINUTES);
+
   if (!initCamera()) {
-    Serial.println("FATAL: camera init failed."); while (true) delay(1000);
+    Serial.println("FATAL: camera init failed."); goToSleep();
   }
 
-  connectWiFi();
-  ensureTimeIST();
-  connectAWS();
+  ensureWiFiConnected();
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("FATAL: no WiFi connected."); goToSleep();
+  }
 
-  lastPublishMs = millis();
+  ensureTimeIST();
+  if (!connectAWS()) {
+    Serial.println("MQTT connect failed; skipping publish."); goToSleep();
+  }
+
+  // Single image capture and publish
+  uint8_t* img = nullptr; size_t len = 0;
+  if (captureToPSRAM(img, len)) {
+    if (mqttClient.connected()) {
+      publishImageBinary(img, len);
+    }
+    free(img);
+  } else {
+    Serial.println("Capture failed.");
+  }
+
+  mqttClient.disconnect();
+  WiFi.disconnect(true);
+  Serial.printf("Going to deep sleep for %u minutes...\n", (unsigned)WAKE_INTERVAL_MINUTES);
+  goToSleep();
 }
 
 void loop() {
-  if (WiFi.status() != WL_CONNECTED) { Serial.println("WiFi lost. Reconnecting..."); connectWiFi(); }
+  // Never reached: setup() calls goToSleep() and device reboots on wake.
+  delay(1000);
+}
 
-  if (!mqttClient.connected()) {
-    unsigned long now = millis();
-    if (now - lastMqttAttempt > MQTT_RETRY_MS) {
-      lastMqttAttempt = now;
-      connectAWS();
-    }
-  } else {
-    mqttClient.loop();
-  }
-
-  unsigned long now = millis();
-  if (now - lastPublishMs >= PUBLISH_INTERVAL_MS) {
-    lastPublishMs = now;
-
-    if (mqttClient.connected()) {
-      uint8_t* img = nullptr; size_t len = 0;
-      if (captureToPSRAM(img, len)) {
-        publishImageBinary(img, len);
-        free(img); // PSRAM or DRAM — free() is fine
-      }
-    } else {
-      Serial.println("Skip publish: MQTT not connected.");
-    }
-  }
+static void goToSleep() {
+  esp_sleep_enable_timer_wakeup(WAKE_INTERVAL_US);
+  esp_deep_sleep_start();
 }
